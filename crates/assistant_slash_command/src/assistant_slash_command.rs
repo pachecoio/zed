@@ -321,7 +321,22 @@ impl SlashCommandLine {
             }
             ix = next_ix;
         }
-        call
+        if let Some(mut call) = call {
+            // ensure the command name is not empty
+            if call.name.is_empty() {
+                return None;
+            }
+
+            // trim trailing empty argument if the user ended the line with
+            // whitespace
+            if matches!(call.arguments.last(), Some(arg) if arg.is_empty()) {
+                call.arguments.pop();
+            }
+
+            Some(call)
+        } else {
+            None
+        }
     }
 }
 
