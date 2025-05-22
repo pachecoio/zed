@@ -13534,6 +13534,7 @@ impl Editor {
                             file.clone(),
                             Some(runnable.language.clone()),
                             worktree_id,
+                            Some(project.clone()),
                             cx,
                         )
                     })
