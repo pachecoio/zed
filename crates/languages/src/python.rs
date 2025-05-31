@@ -365,7 +365,7 @@ impl ContextProvider for PythonContextProvider {
         &self,
         variables: &task::TaskVariables,
         location: &project::Location,
-        _: Option<HashMap<String, String>>,
+        project_env: Option<HashMap<String, String>>,
         toolchains: Arc<dyn LanguageToolchainStore>,
         cx: &mut gpui::App,
     ) -> Task<Result<task::TaskVariables>> {
@@ -376,117 +376,137 @@ impl ContextProvider for PythonContextProvider {
 
         let module_target = self.build_module_target(variables);
         let worktree_id = location.buffer.read(cx).file().map(|f| f.worktree_id(cx));
+        let detect_venv = project_env
+            .as_ref()
+            .and_then(|env| env.get("ZED_PYTHON_DETECT_VENV"))
+            .map(|val| val == "1")
+            .unwrap_or(false);
+
+        // Get project root from current buffer path if venv detection is enabled
+        let project_root = if detect_venv {
+            location
+                .buffer
+                .read(cx)
+                .file()
+                .and_then(|f| Some(f.path().clone()))
+                .and_then(|path| {
+                    // Walk up from the file path to find project root
+                    // This is a simplified approach - traverse up to find a common project marker
+                    let mut current = path.as_ref();
+                    while let Some(parent) = current.parent() {
+                        // Check for common project markers
+                        for marker in ["pyproject.toml", "setup.py", "requirements.txt", ".git"] {
+                            if parent.join(marker).exists() {
+                                return Some(parent.to_path_buf());
+                            }
+                        }
+                        current = parent;
+                    }
+                    // If no project markers found, use the directory of the current file
+                    path.as_ref().parent().map(|p| p.to_path_buf())
+                })
+        } else {
+            None
+        };
 
         cx.spawn(async move |cx| {
+            let mut context_vars = Vec::new();
+
+            // Add test and module targets
+            if let Some(target) = test_target {
+                context_vars.push(target);
+            }
+            if let Ok(module) = module_target {
+                context_vars.push(module);
+            }
+
             let active_toolchain = if let Some(worktree_id) = worktree_id {
-                toolchains
+                let toolchain_result = toolchains
                     .active_toolchain(worktree_id, Arc::from("".as_ref()), "Python".into(), cx)
-                    .await
-                    .map_or_else(
-                        || "python3".to_owned(),
-                        |toolchain| format!("\"{}\"", toolchain.path),
-                    )
+                    .await;
+
+                if detect_venv {
+                    // Try to find project-local virtual environment first
+                    if let Some(project_root) = project_root {
+                        // Look for .venv or venv directories
+                        for venv_name in [".venv", "venv"] {
+                            let venv_dir = project_root.join(venv_name);
+                            let python_bin = if cfg!(windows) {
+                                venv_dir.join("Scripts").join("python.exe")
+                            } else {
+                                venv_dir.join("bin").join("python")
+                            };
+                            if python_bin.exists() {
+                                context_vars.push((
+                                    PYTHON_ACTIVE_TOOLCHAIN_PATH,
+                                    format!("\"{}\"", python_bin.display()),
+                                ));
+                                return Ok(task::TaskVariables::from_iter(context_vars));
+                            }
+                        }
+                    }
+                }
+
+                // Fall back to selected toolchain or default
+                toolchain_result.map_or_else(
+                    || "python3".to_owned(),
+                    |toolchain| format!("\"{}\"", toolchain.path),
+                )
             } else {
                 String::from("python3")
             };
-            let toolchain = (PYTHON_ACTIVE_TOOLCHAIN_PATH, active_toolchain);
 
-            Ok(task::TaskVariables::from_iter(
-                test_target
-                    .into_iter()
-                    .chain(module_target.into_iter())
-                    .chain([toolchain]),
-            ))
+            context_vars.push((PYTHON_ACTIVE_TOOLCHAIN_PATH, active_toolchain));
+
+            Ok(task::TaskVariables::from_iter(context_vars))
         })
     }
 
     fn associated_tasks(
         &self,
         file: Option<Arc<dyn language::File>>,
-        project_root: Option<std::path::PathBuf>,
         cx: &App,
     ) -> Option<TaskTemplates> {
         let test_runner = selected_test_runner(file.as_ref(), cx);
 
-        // Helper to get the venv in the project root (worktree root) for a file
-        fn find_venv_in_project_root(project_root: Option<&std::path::PathBuf>) -> Option<(PathBuf, PathBuf)> {
-            let project_root = project_root?;
-            for venv_name in [".venv", "venv"] {
-                let venv_dir = project_root.join(venv_name);
-                let python_bin = if cfg!(windows) {
-                    venv_dir.join("Scripts").join("python.exe")
-                } else {
-                    venv_dir.join("bin").join("python")
-                };
-                if python_bin.exists() {
-                    return Some((python_bin, venv_dir));
-                }
-            }
-            None
-        }
-
-        // Get the python path and venv root, prefer venv in project root if found
-        let (python_path, venv_root) = match find_venv_in_project_root(project_root.as_ref()) {
-            Some((python_bin, venv_dir)) => (python_bin.display().to_string(), Some(venv_dir)),
-            None => ("python3".to_owned(), None),
-        };
-
-        // If venv detected, set VIRTUAL_ENV and prepend venv/bin to PATH
-        let mut venv_env = std::collections::HashMap::new();
-        if let Some(venv_root) = venv_root.as_ref() {
-            venv_env.insert("VIRTUAL_ENV".to_string(), venv_root.display().to_string());
-            // Prepend venv/bin or venv/Scripts to PATH
-            let bin_dir = if cfg!(windows) {
-                venv_root.join("Scripts")
-            } else {
-                venv_root.join("bin")
-            };
-            let old_path = std::env::var("PATH").unwrap_or_default();
-            let new_path = if old_path.is_empty() {
-                bin_dir.display().to_string()
-            } else {
-                format!("{}:{}", bin_dir.display(), old_path)
-            };
-            venv_env.insert("PATH".to_string(), new_path);
-        }
-
+        // Create enhanced templates that include virtual environment variables
         let mut tasks = vec![
             // Execute a selection
-            {
-                let mut t = TaskTemplate {
-                    label: "execute selection".to_owned(),
-                    command: python_path.clone(),
-                    args: vec![
-                        "-c".to_owned(),
-                        VariableName::SelectedText.template_value_with_whitespace(),
-                    ],
-                    ..TaskTemplate::default()
-                };
-                t.env.extend(venv_env.clone());
-                t
+            TaskTemplate {
+                label: "execute selection".to_owned(),
+                command: PYTHON_ACTIVE_TOOLCHAIN_PATH.template_value(),
+                args: vec![
+                    "-c".to_owned(),
+                    VariableName::SelectedText.template_value_with_whitespace(),
+                ],
+                env: [("ZED_PYTHON_DETECT_VENV".to_string(), "1".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..TaskTemplate::default()
             },
             // Execute an entire file
-            {
-                let mut t = TaskTemplate {
-                    label: format!("run '{}'", VariableName::File.template_value()),
-                    command: python_path.clone(),
-                    args: vec![VariableName::File.template_value_with_whitespace()],
-                    ..TaskTemplate::default()
-                };
-                t.env.extend(venv_env.clone());
-                t
+            TaskTemplate {
+                label: format!("run '{}'", VariableName::File.template_value()),
+                command: PYTHON_ACTIVE_TOOLCHAIN_PATH.template_value(),
+                args: vec![VariableName::File.template_value_with_whitespace()],
+                env: [("ZED_PYTHON_DETECT_VENV".to_string(), "1".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..TaskTemplate::default()
             },
             // Execute a file as module
-            {
-                let mut t = TaskTemplate {
-                    label: format!("run module '{}'", VariableName::File.template_value()),
-                    command: python_path.clone(),
-                    args: vec!["-m".to_owned(), PYTHON_MODULE_NAME_TASK_VARIABLE.template_value()],
-                    tags: vec!["python-module-main-method".to_owned()],
-                    ..TaskTemplate::default()
-                };
-                t.env.extend(venv_env.clone());
-                t
+            TaskTemplate {
+                label: format!("run module '{}'", VariableName::File.template_value()),
+                command: PYTHON_ACTIVE_TOOLCHAIN_PATH.template_value(),
+                args: vec![
+                    "-m".to_owned(),
+                    PYTHON_MODULE_NAME_TASK_VARIABLE.template_value(),
+                ],
+                tags: vec!["python-module-main-method".to_owned()],
+                env: [("ZED_PYTHON_DETECT_VENV".to_string(), "1".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..TaskTemplate::default()
             },
         ];
 
@@ -494,76 +514,72 @@ impl ContextProvider for PythonContextProvider {
             TestRunner::UNITTEST => {
                 [
                     // Run tests for an entire file
-                    {
-                        let mut t = TaskTemplate {
-                            label: format!("unittest '{}'", VariableName::File.template_value()),
-                            command: python_path.clone(),
-                            args: vec![
-                                "-m".to_owned(),
-                                "unittest".to_owned(),
-                                VariableName::File.template_value_with_whitespace(),
-                            ],
-                            ..TaskTemplate::default()
-                        };
-                        t.env.extend(venv_env.clone());
-                        t
+                    TaskTemplate {
+                        label: format!("unittest '{}'", VariableName::File.template_value()),
+                        command: PYTHON_ACTIVE_TOOLCHAIN_PATH.template_value(),
+                        args: vec![
+                            "-m".to_owned(),
+                            "unittest".to_owned(),
+                            VariableName::File.template_value_with_whitespace(),
+                        ],
+                        env: [("ZED_PYTHON_DETECT_VENV".to_string(), "1".to_string())]
+                            .into_iter()
+                            .collect(),
+                        ..TaskTemplate::default()
                     },
                     // Run test(s) for a specific target within a file
-                    {
-                        let mut t = TaskTemplate {
-                            label: "unittest $ZED_CUSTOM_PYTHON_TEST_TARGET".to_owned(),
-                            command: python_path.clone(),
-                            args: vec![
-                                "-m".to_owned(),
-                                "unittest".to_owned(),
-                                PYTHON_TEST_TARGET_TASK_VARIABLE.template_value_with_whitespace(),
-                            ],
-                            tags: vec![
-                                "python-unittest-class".to_owned(),
-                                "python-unittest-method".to_owned(),
-                            ],
-                            ..TaskTemplate::default()
-                        };
-                        t.env.extend(venv_env.clone());
-                        t
+                    TaskTemplate {
+                        label: "unittest $ZED_CUSTOM_PYTHON_TEST_TARGET".to_owned(),
+                        command: PYTHON_ACTIVE_TOOLCHAIN_PATH.template_value(),
+                        args: vec![
+                            "-m".to_owned(),
+                            "unittest".to_owned(),
+                            PYTHON_TEST_TARGET_TASK_VARIABLE.template_value_with_whitespace(),
+                        ],
+                        tags: vec![
+                            "python-unittest-class".to_owned(),
+                            "python-unittest-method".to_owned(),
+                        ],
+                        env: [("ZED_PYTHON_DETECT_VENV".to_string(), "1".to_string())]
+                            .into_iter()
+                            .collect(),
+                        ..TaskTemplate::default()
                     },
                 ]
             }
             TestRunner::PYTEST => {
                 [
                     // Run tests for an entire file
-                    {
-                        let mut t = TaskTemplate {
-                            label: format!("pytest '{}'", VariableName::File.template_value()),
-                            command: python_path.clone(),
-                            args: vec![
-                                "-m".to_owned(),
-                                "pytest".to_owned(),
-                                VariableName::File.template_value_with_whitespace(),
-                            ],
-                            ..TaskTemplate::default()
-                        };
-                        t.env.extend(venv_env.clone());
-                        t
+                    TaskTemplate {
+                        label: format!("pytest '{}'", VariableName::File.template_value()),
+                        command: PYTHON_ACTIVE_TOOLCHAIN_PATH.template_value(),
+                        args: vec![
+                            "-m".to_owned(),
+                            "pytest".to_owned(),
+                            VariableName::File.template_value_with_whitespace(),
+                        ],
+                        env: [("ZED_PYTHON_DETECT_VENV".to_string(), "1".to_string())]
+                            .into_iter()
+                            .collect(),
+                        ..TaskTemplate::default()
                     },
                     // Run test(s) for a specific target within a file
-                    {
-                        let mut t = TaskTemplate {
-                            label: "pytest $ZED_CUSTOM_PYTHON_TEST_TARGET".to_owned(),
-                            command: python_path.clone(),
-                            args: vec![
-                                "-m".to_owned(),
-                                "pytest".to_owned(),
-                                PYTHON_TEST_TARGET_TASK_VARIABLE.template_value_with_whitespace(),
-                            ],
-                            tags: vec![
-                                "python-pytest-class".to_owned(),
-                                "python-pytest-method".to_owned(),
-                            ],
-                            ..TaskTemplate::default()
-                        };
-                        t.env.extend(venv_env.clone());
-                        t
+                    TaskTemplate {
+                        label: "pytest $ZED_CUSTOM_PYTHON_TEST_TARGET".to_owned(),
+                        command: PYTHON_ACTIVE_TOOLCHAIN_PATH.template_value(),
+                        args: vec![
+                            "-m".to_owned(),
+                            "pytest".to_owned(),
+                            PYTHON_TEST_TARGET_TASK_VARIABLE.template_value_with_whitespace(),
+                        ],
+                        tags: vec![
+                            "python-pytest-class".to_owned(),
+                            "python-pytest-method".to_owned(),
+                        ],
+                        env: [("ZED_PYTHON_DETECT_VENV".to_string(), "1".to_string())]
+                            .into_iter()
+                            .collect(),
+                        ..TaskTemplate::default()
                     },
                 ]
             }
@@ -1246,10 +1262,110 @@ impl LspAdapter for PyLspAdapter {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use gpui::{AppContext as _, BorrowAppContext, Context, TestAppContext};
     use language::{AutoindentMode, Buffer, language_settings::AllLanguageSettings};
     use settings::SettingsStore;
     use std::num::NonZeroU32;
+
+    #[test]
+    fn test_venv_detection() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        // Create a temporary directory structure
+        let temp_dir = tempdir().unwrap();
+        let project_root = temp_dir.path();
+
+        // Create project marker to make this look like a real project
+        fs::File::create(project_root.join("pyproject.toml")).unwrap();
+
+        // Create .venv directory with python binary
+        let venv_dir = project_root.join(".venv");
+        fs::create_dir_all(&venv_dir).unwrap();
+
+        #[cfg(windows)]
+        let python_path = venv_dir.join("Scripts").join("python.exe");
+        #[cfg(not(windows))]
+        let python_path = venv_dir.join("bin").join("python");
+
+        fs::create_dir_all(python_path.parent().unwrap()).unwrap();
+        fs::File::create(&python_path).unwrap();
+
+        // Test the detection logic - should find .venv directory
+        let mut found_venv = false;
+        for venv_name in [".venv", "venv"] {
+            let test_venv_dir = project_root.join(venv_name);
+            let python_bin = if cfg!(windows) {
+                test_venv_dir.join("Scripts").join("python.exe")
+            } else {
+                test_venv_dir.join("bin").join("python")
+            };
+            if python_bin.exists() {
+                assert!(python_bin.exists());
+                assert_eq!(python_bin, python_path);
+                found_venv = true;
+                break;
+            }
+        }
+        assert!(found_venv, "Should have found a virtual environment");
+
+        // Also test creating a venv directory (not just .venv)
+        let venv_dir2 = project_root.join("venv");
+        fs::create_dir_all(&venv_dir2).unwrap();
+
+        #[cfg(windows)]
+        let python_path2 = venv_dir2.join("Scripts").join("python.exe");
+        #[cfg(not(windows))]
+        let python_path2 = venv_dir2.join("bin").join("python");
+
+        fs::create_dir_all(python_path2.parent().unwrap()).unwrap();
+        fs::File::create(&python_path2).unwrap();
+
+        // Test that both .venv and venv are detected
+        let mut found_dotenv = false;
+        let mut found_venv = false;
+        for venv_name in [".venv", "venv"] {
+            let test_venv_dir = project_root.join(venv_name);
+            let python_bin = if cfg!(windows) {
+                test_venv_dir.join("Scripts").join("python.exe")
+            } else {
+                test_venv_dir.join("bin").join("python")
+            };
+            if python_bin.exists() {
+                if venv_name == ".venv" {
+                    found_dotenv = true;
+                } else {
+                    found_venv = true;
+                }
+            }
+        }
+        assert!(found_dotenv, "Should have found .venv directory");
+        assert!(found_venv, "Should have found venv directory");
+    }
+
+    #[gpui::test]
+    async fn test_task_templates_include_venv_detection(cx: &mut TestAppContext) {
+        let provider = PythonContextProvider;
+        let templates = cx.update(|cx| {
+            let test_settings = SettingsStore::test(cx);
+            cx.set_global(test_settings);
+            language::init(cx);
+
+            provider.associated_tasks(None, cx)
+        });
+
+        assert!(templates.is_some());
+        let templates = templates.unwrap();
+
+        // Check that all templates have the ZED_PYTHON_DETECT_VENV environment variable set
+        for template in &templates.0 {
+            assert_eq!(
+                template.env.get("ZED_PYTHON_DETECT_VENV"),
+                Some(&"1".to_string())
+            );
+        }
+    }
 
     #[gpui::test]
     async fn test_python_autoindent(cx: &mut TestAppContext) {

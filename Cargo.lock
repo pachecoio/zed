@@ -8898,6 +8898,7 @@ dependencies = [
  "smol",
  "snippet_provider",
  "task",
+ "tempfile",
  "text",
  "theme",
  "toml 0.8.20",

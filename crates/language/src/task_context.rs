@@ -1,4 +1,4 @@
-use std::{ops::Range, sync::Arc, path::PathBuf};
+use std::{ops::Range, sync::Arc};
 
 use crate::{LanguageToolchainStore, Location, Runnable};
 
@@ -34,14 +34,12 @@ pub trait ContextProvider: Send + Sync {
         Task::ready(Ok(TaskVariables::default()))
     }
 
-    /// Provides all tasks, associated with the current language. The project_root argument is used for project root lookups if available.
+    /// Provides all tasks, associated with the current language.
     fn associated_tasks(
         &self,
         _: Option<Arc<dyn crate::File>>,
-        project_root: Option<PathBuf>,
         _cx: &App,
     ) -> Option<TaskTemplates> {
-        let _ = project_root;
         None
     }
 
